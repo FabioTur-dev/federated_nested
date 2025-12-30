@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # ============================================================
-# OMP / MKL FIX — MUST BE FIRST (Windows safe)
+# OMP / MKL FIX — MUST BE FIRST
 # ============================================================
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -44,7 +44,7 @@ def l2_norm(module: nn.Module) -> float:
 
 
 # ============================================================
-# LoRA (minimal)
+# LoRA (minimal, stable)
 # ============================================================
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, r=16, alpha=32, dropout=0.05):
@@ -140,7 +140,7 @@ class ClientCfg:
     # local consolidation
     promote_k: int = 3
     promote_alpha: float = 0.3
-    drift_th_local: float = 0.03  # stable vs full
+    drift_th_local: float = 0.03  # stable_local vs full
 
 
 # ============================================================
@@ -177,39 +177,43 @@ class NestedClient:
     def logits_full(self, z):
         return self.fast(z) + self.med(z) + self.slow(z)
 
-    def logits_stable(self, z):
+    def logits_stable_local(self, z):
+        # used for global evaluation stability: med+slow
         return self.med(z) + self.slow(z)
+
+    def logits_slow_only(self, z):
+        return self.slow(z)
 
     @torch.no_grad()
     def local_drift(self, anchor_batch: torch.Tensor) -> float:
         """
-        local drift score = mean|softmax(stable)-softmax(full)| on local anchor batch.
-        (Only debug / local consolidation signal; not sent to server.)
+        local drift score = mean|softmax(stable_local)-softmax(full)| on local anchor batch.
         """
         self.backbone.eval()
         self.fast.eval(); self.med.eval(); self.slow.eval()
 
         x = anchor_batch.to(DEVICE)
         z = self.backbone(x)
-        p_stable = F.softmax(self.logits_stable(z), -1)
+        p_stable = F.softmax(self.logits_stable_local(z), -1)
         p_full   = F.softmax(self.logits_full(z), -1)
         return float((p_stable - p_full).abs().mean().item())
 
     @torch.no_grad()
-    def signature_on_reference_A(self, refA_loader) -> torch.Tensor:
+    def signature_slow_on_refA(self, refA_loader) -> torch.Tensor:
         """
-        DATA-FREE SERVER: return s_i in R^C on CANONICAL A reference set.
-        Same input distribution for all clients.
+        DATA-FREE SERVER SIGNATURE:
+        s_i = mean softmax(slow(z)) over CANONICAL A reference set.
+        This is the correct stable-only signal for gating.
         """
         self.backbone.eval()
-        self.med.eval(); self.slow.eval()
+        self.slow.eval()
 
         acc = None
         n = 0
         for x, _ in refA_loader:
             x = x.to(DEVICE)
             z = self.backbone(x)
-            p = F.softmax(self.logits_stable(z), -1).detach().cpu()  # [B,C]
+            p = F.softmax(self.logits_slow_only(z), -1).detach().cpu()  # [B,C]
             acc = p.sum(dim=0) if acc is None else (acc + p.sum(dim=0))
             n += p.shape[0]
 
@@ -276,8 +280,8 @@ class NestedClient:
             else:
                 promoted["blocked"] = 1
 
-        # IMPORTANT: signature computed AFTER training, on canonical A reference set
-        sigA = self.signature_on_reference_A(refA_loader_for_signature)
+        # signature computed AFTER training
+        sig = self.signature_slow_on_refA(refA_loader_for_signature)
 
         dbg = {
             "loss": float(np.mean(losses)) if losses else 0.0,
@@ -286,7 +290,7 @@ class NestedClient:
             "norm_med": l2_norm(self.med),
             "norm_slow": l2_norm(self.slow),
         }
-        return dbg, promoted, sigA
+        return dbg, promoted, sig
 
     @torch.no_grad()
     def eval_acc(self, loader, use_fast: bool):
@@ -297,7 +301,7 @@ class NestedClient:
         for x, y in loader:
             x = x.to(DEVICE)
             z = self.backbone(x)
-            logits = self.logits_full(z) if use_fast else self.logits_stable(z)
+            logits = self.logits_full(z) if use_fast else self.logits_stable_local(z)
             pred = logits.argmax(-1).cpu()
             correct += (pred == y).sum().item()
             total += y.numel()
